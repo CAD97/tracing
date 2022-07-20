@@ -94,7 +94,10 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       - uses: dtolnay/rust-toolchain@stable
-
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ runner.os }}
+          key: check
       - name: install cargo-hack
         uses: taiki-e/install-action@cargo-hack
       - name: cargo hack check
@@ -132,16 +135,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - name: install rust nightly
+      - name: install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
-      - name: "install Rust ${{ env.MSRV }}"
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.MSRV }}
       - name: "install Rust ${{ env.APPENDER_MSRV }}"
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.APPENDER_MSRV }}
+      - name: "install Rust ${{ env.MSRV }}"
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.MSRV }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ runner.os }}
+          key: check
       - name: install cargo-hack
         uses: taiki-e/install-action@cargo-hack
       - name: install cargo-minimal-versions
@@ -188,6 +195,10 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ runner.os }}
+          key: build
       - name: install cargo-nextest
         uses: taiki-e/install-action@nextest
       - name: Run tests
@@ -230,6 +241,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           target: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ runner.os }}
+          key: build-wasm32
       - name: build all tests
         run: cargo test --no-run -p ${{ matrix.subcrate }}
 
@@ -246,6 +261,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           target: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ runner.os }}
+          key: test-wasm32
       - name: install test runner for wasm
         uses: taiki-e/install-action@wasm-pack
       - name: run wasm tests
