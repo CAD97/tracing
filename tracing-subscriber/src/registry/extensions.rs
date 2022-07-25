@@ -1,37 +1,8 @@
 // taken from https://github.com/hyperium/http/blob/master/src/extensions.rs.
 
+use super::AnyMap;
 use crate::sync::{RwLockReadGuard, RwLockWriteGuard};
-use std::{
-    any::{Any, TypeId},
-    collections::HashMap,
-    fmt,
-    hash::{BuildHasherDefault, Hasher},
-};
-
-#[allow(warnings)]
-type AnyMap = HashMap<TypeId, Box<dyn Any + Send + Sync>, BuildHasherDefault<IdHasher>>;
-
-/// With TypeIds as keys, there's no need to hash them. They are already hashes
-/// themselves, coming from the compiler. The IdHasher holds the u64 of
-/// the TypeId, and then returns it, instead of doing any bit fiddling.
-#[derive(Default, Debug)]
-struct IdHasher(u64);
-
-impl Hasher for IdHasher {
-    fn write(&mut self, _: &[u8]) {
-        unreachable!("TypeId calls write_u64");
-    }
-
-    #[inline]
-    fn write_u64(&mut self, id: u64) {
-        self.0 = id;
-    }
-
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.0
-    }
-}
+use std::fmt;
 
 /// An immutable, read-only reference to a Span's extensions.
 #[derive(Debug)]
@@ -135,46 +106,24 @@ impl ExtensionsInner {
     /// If a extension of this type already existed, it will
     /// be returned.
     pub(crate) fn insert<T: Send + Sync + 'static>(&mut self, val: T) -> Option<T> {
-        self.map
-            .insert(TypeId::of::<T>(), Box::new(val))
-            .and_then(|boxed| {
-                #[allow(warnings)]
-                {
-                    (boxed as Box<dyn Any + 'static>)
-                        .downcast()
-                        .ok()
-                        .map(|boxed| *boxed)
-                }
-            })
+        self.map.insert(Box::new(val)).map(|boxed| *boxed)
     }
 
     /// Get a reference to a type previously inserted on this `Extensions`.
     pub(crate) fn get<T: 'static>(&self) -> Option<&T> {
-        self.map
-            .get(&TypeId::of::<T>())
-            .and_then(|boxed| (&**boxed as &(dyn Any + 'static)).downcast_ref())
+        self.map.get()
     }
 
     /// Get a mutable reference to a type previously inserted on this `Extensions`.
     pub(crate) fn get_mut<T: 'static>(&mut self) -> Option<&mut T> {
-        self.map
-            .get_mut(&TypeId::of::<T>())
-            .and_then(|boxed| (&mut **boxed as &mut (dyn Any + 'static)).downcast_mut())
+        self.map.get_mut()
     }
 
     /// Remove a type from this `Extensions`.
     ///
     /// If a extension of this type existed, it will be returned.
     pub(crate) fn remove<T: Send + Sync + 'static>(&mut self) -> Option<T> {
-        self.map.remove(&TypeId::of::<T>()).and_then(|boxed| {
-            #[allow(warnings)]
-            {
-                (boxed as Box<dyn Any + 'static>)
-                    .downcast()
-                    .ok()
-                    .map(|boxed| *boxed)
-            }
-        })
+        self.map.remove().and_then(|boxed| *boxed)
     }
 
     /// Clear the `ExtensionsInner` in-place, dropping any elements in the map but

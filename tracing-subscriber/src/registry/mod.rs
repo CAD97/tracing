@@ -64,10 +64,15 @@ use tracing_core::{field::FieldSet, span::Id, Metadata};
 
 feature! {
     #![feature = "std"]
+
     /// A module containing a type map of span extensions.
     mod extensions;
+    /// A module implementing a simple Map<TypeId::of(T), Box<T>> "AnyMap"
+    mod anymap;
+
     pub use extensions::{Extensions, ExtensionsMut};
 
+    use anymap::AnyMap;
 }
 
 feature! {
