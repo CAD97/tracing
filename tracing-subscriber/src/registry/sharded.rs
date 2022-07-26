@@ -1,15 +1,19 @@
 use sharded_slab::{pool::Ref, Clear, Pool};
 use thread_local::ThreadLocal;
 
-use super::stack::SpanStack;
+use super::{
+    anymap::{AnyMap, TypeMap},
+    stack::SpanStack,
+};
 use crate::{
     filter::{FilterId, FilterMap, FilterState},
     registry::{
-        extensions::{Extensions, ExtensionsInner, ExtensionsMut},
+        extensions::{Extensions, ExtensionsMut},
         LookupSpan, SpanData,
     },
     sync::RwLock,
 };
+use core::fmt::Debug;
 use std::{
     cell::{self, Cell, RefCell},
     sync::atomic::{fence, AtomicUsize, Ordering},
@@ -88,10 +92,11 @@ use tracing_core::{
 /// [stored span data]: crate::registry::SpanData::extensions_mut
 #[cfg(feature = "registry")]
 #[cfg_attr(docsrs, doc(cfg(all(feature = "registry", feature = "std"))))]
-#[derive(Debug)]
 pub struct Registry {
     spans: Pool<DataInner>,
     current_spans: ThreadLocal<RefCell<SpanStack>>,
+    // T => Pool<Option<T>>
+    extensions: RwLock<AnyMap>,
     next_filter_id: u8,
 }
 
@@ -107,10 +112,11 @@ pub struct Registry {
 /// [`Registry`]: struct.Registry.html
 #[cfg(feature = "registry")]
 #[cfg_attr(docsrs, doc(cfg(all(feature = "registry", feature = "std"))))]
-#[derive(Debug)]
 pub struct Data<'a> {
     /// Immutable reference to the pooled `DataInner` entry.
     inner: Ref<'a, DataInner>,
+    // T => Pool<Option<T>>
+    extensions: &'a RwLock<AnyMap>,
 }
 
 /// Stored data associated with a span.
@@ -125,12 +131,20 @@ struct DataInner {
     metadata: &'static Metadata<'static>,
     parent: Option<Id>,
     ref_count: AtomicUsize,
-    // The span's `Extensions` typemap. Allocations for the `HashMap` backing
-    // this are pooled and reused in place.
-    pub(crate) extensions: RwLock<ExtensionsInner>,
+    extensions: RwLock<TypeMap<usize>>,
 }
 
 // === impl Registry ===
+
+impl Debug for Registry {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Registry")
+            .field("spans", &self.spans)
+            .field("current_spans", &self.current_spans)
+            .field("next_filter_id", &self.next_filter_id)
+            .finish_non_exhaustive()
+    }
+}
 
 impl Default for Registry {
     fn default() -> Self {
@@ -138,6 +152,7 @@ impl Default for Registry {
             spans: Pool::new(),
             current_spans: ThreadLocal::new(),
             next_filter_id: 0,
+            extensions: Default::default(),
         }
     }
 }
@@ -360,7 +375,8 @@ impl<'a> LookupSpan<'a> for Registry {
 
     fn span_data(&'a self, id: &Id) -> Option<Self::Data> {
         let inner = self.get(id)?;
-        Some(Data { inner })
+        let extensions = &self.extensions;
+        Some(Data { inner, extensions })
     }
 
     fn register_filter(&mut self) -> FilterId {
@@ -405,6 +421,14 @@ impl<'a> Drop for CloseGuard<'a> {
 
 // === impl Data ===
 
+impl Debug for Data<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Data")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'a> SpanData<'a> for Data<'a> {
     fn id(&self) -> Id {
         idx_to_id(self.inner.key())
@@ -419,11 +443,15 @@ impl<'a> SpanData<'a> for Data<'a> {
     }
 
     fn extensions(&self) -> Extensions<'_> {
-        Extensions::new(self.inner.extensions.read().expect("Mutex poisoned"))
+        let store = self.extensions.read().expect("Mutex poisoned");
+        let keys = self.inner.extensions.read().expect("Mutex poisoned");
+        Extensions::new(store, keys)
     }
 
     fn extensions_mut(&self) -> ExtensionsMut<'_> {
-        ExtensionsMut::new(self.inner.extensions.write().expect("Mutex poisoned"))
+        let store = &self.extensions;
+        let keys = self.inner.extensions.write().expect("Mutex poisoned");
+        ExtensionsMut::new(store, keys)
     }
 
     #[inline]
@@ -474,7 +502,7 @@ impl Default for DataInner {
             metadata: &NULL_METADATA,
             parent: None,
             ref_count: AtomicUsize::new(0),
-            extensions: RwLock::new(ExtensionsInner::new()),
+            extensions: RwLock::new(TypeMap::default()),
         }
     }
 }

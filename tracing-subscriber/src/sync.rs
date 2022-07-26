@@ -21,7 +21,7 @@ mod parking_lot_impl {
     pub(crate) use parking_lot::{RwLockReadGuard, RwLockWriteGuard};
     use std::sync::{LockResult, TryLockError, TryLockResult};
 
-    #[derive(Debug)]
+    #[derive(Debug, Default)]
     pub(crate) struct RwLock<T> {
         inner: parking_lot::RwLock<T>,
     }

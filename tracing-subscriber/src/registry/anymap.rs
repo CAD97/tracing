@@ -4,10 +4,10 @@ use std::{
     hash::{BuildHasherDefault, Hasher},
 };
 
+pub(crate) type TypeMap<T> = HashMap<TypeId, T, BuildHasherDefault<TypeIdHasher>>;
+
 #[derive(Default)]
-pub(crate) struct AnyMap(
-    HashMap<TypeId, Box<dyn Any + Send + Sync>, BuildHasherDefault<TypeIdHasher>>,
-);
+pub(crate) struct AnyMap(TypeMap<Box<dyn Any + Send + Sync>>);
 
 impl AnyMap {
     pub(crate) fn insert<T: Send + Sync + 'static>(&mut self, value: Box<T>) -> Option<Box<T>> {

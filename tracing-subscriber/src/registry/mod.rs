@@ -71,8 +71,6 @@ feature! {
     mod anymap;
 
     pub use extensions::{Extensions, ExtensionsMut};
-
-    use anymap::AnyMap;
 }
 
 feature! {

@@ -1,39 +1,52 @@
-// taken from https://github.com/hyperium/http/blob/master/src/extensions.rs.
+use super::anymap::{AnyMap, TypeMap};
+use crate::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use core::any::type_name;
+use sharded_slab::Pool;
+use std::{any::TypeId, fmt};
 
-use super::AnyMap;
-use crate::sync::{RwLockReadGuard, RwLockWriteGuard};
-use std::fmt;
+type ExtPool<T> = Pool<Option<T>>;
 
 /// An immutable, read-only reference to a Span's extensions.
-#[derive(Debug)]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub struct Extensions<'a> {
-    inner: RwLockReadGuard<'a, ExtensionsInner>,
+    // T => ExtPool<T>
+    store: RwLockReadGuard<'a, AnyMap>,
+    keys: RwLockReadGuard<'a, TypeMap<usize>>,
 }
 
 impl<'a> Extensions<'a> {
     #[cfg(feature = "registry")]
-    pub(crate) fn new(inner: RwLockReadGuard<'a, ExtensionsInner>) -> Self {
-        Self { inner }
+    pub(crate) fn new(
+        store: RwLockReadGuard<'a, AnyMap>,
+        keys: RwLockReadGuard<'a, TypeMap<usize>>,
+    ) -> Self {
+        Self { store, keys }
     }
 
     /// Immutably borrows a type previously inserted into this `Extensions`.
     pub fn get<T: 'static>(&self) -> Option<&T> {
-        self.inner.get::<T>()
+        let &key = self.keys.get(&TypeId::of::<T>())?;
+        let pool = self.store.get::<ExtPool<T>>()?;
+        let ext = pool.get(key)?;
+        ext.as_ref()
     }
 }
 
 /// An mutable reference to a Span's extensions.
-#[derive(Debug)]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub struct ExtensionsMut<'a> {
-    inner: RwLockWriteGuard<'a, ExtensionsInner>,
+    // T => ExtPool<T>
+    store: &'a RwLock<AnyMap>,
+    keys: RwLockWriteGuard<'a, TypeMap<usize>>,
 }
 
 impl<'a> ExtensionsMut<'a> {
     #[cfg(feature = "registry")]
-    pub(crate) fn new(inner: RwLockWriteGuard<'a, ExtensionsInner>) -> Self {
-        Self { inner }
+    pub(crate) fn new(
+        store: &'a RwLock<AnyMap>,
+        keys: RwLockWriteGuard<'a, TypeMap<usize>>,
+    ) -> Self {
+        Self { store, keys }
     }
 
     /// Insert a type into this `Extensions`.
@@ -58,167 +71,161 @@ impl<'a> ExtensionsMut<'a> {
     ///
     /// [subscriber]: crate::subscribe::Subscribe
     pub fn insert<T: Send + Sync + 'static>(&mut self, val: T) {
-        assert!(self.replace(val).is_none())
+        if self.keys.contains_key(&TypeId::of::<T>()) {
+            panic!(
+                "Extensions already contain a value for type `{:?}`",
+                type_name::<T>()
+            );
+        }
+
+        // We try a read lock first to reduce contention on the global RwLock.
+        let mut store = self.store.read().expect("Mutex poisoned");
+        let pool = match store.get::<ExtPool<T>>() {
+            Some(pool) => pool,
+            None => {
+                drop(store);
+                self.store
+                    .write()
+                    .expect("Mutex poisoned")
+                    .insert(Box::new(ExtPool::<T>::default()));
+                store = self.store.read().expect("Mutex poisoned");
+                store.get().unwrap()
+            }
+        };
+
+        let key = pool
+            .create_with(|place| *place = Some(val))
+            .expect("Unable to allocate another span extension");
+
+        self.keys.insert(TypeId::of::<T>(), key);
     }
 
     /// Replaces an existing `T` into this extensions.
     ///
     /// If `T` is not present, `Option::None` will be returned.
-    pub fn replace<T: Send + Sync + 'static>(&mut self, val: T) -> Option<T> {
-        self.inner.insert(val)
+    pub fn replace<T: Send + Sync + 'static>(&mut self, val: T) -> Option<()> {
+        let FIXME_BREAKING_CHANGE = ();
+
+        let previous = self.remove::<T>();
+        self.insert(val);
+        previous
     }
 
     /// Get a mutable reference to a type previously inserted on this `ExtensionsMut`.
     pub fn get_mut<T: 'static>(&mut self) -> Option<&mut T> {
-        self.inner.get_mut::<T>()
+        let &key = self.keys.get(&TypeId::of::<T>())?;
+        let store = self.store.read().expect("Mutex poisoned");
+        let pool = store.get::<ExtPool<T>>()?;
+        let ext = pool.get(key)?;
+
+        ext.as_mut()
     }
 
     /// Remove a type from this `Extensions`.
     ///
     /// If a extension of this type existed, it will be returned.
-    pub fn remove<T: Send + Sync + 'static>(&mut self) -> Option<T> {
-        self.inner.remove::<T>()
+    pub fn remove<T: Send + Sync + 'static>(&mut self) -> Option<()> {
+        let FIXME_BREAKING_CHANGE = ();
+
+        let store = self.store.read().expect("Mutex poisoned");
+        self.keys.remove(&TypeId::of::<T>()).map(|key| {
+            store
+                .get::<ExtPool<T>>()
+                .expect("Extensions corrupted")
+                .clear(key); // FIXME(CAD97): s/clear(key);/remove(key)/
+        })
     }
 }
 
-/// A type map of span extensions.
-///
-/// [ExtensionsInner] is used by [Data] to store and
-/// span-specific data. A given [Subscriber] can read and write
-/// data that it is interested in recording and emitting.
-#[derive(Default)]
-pub(crate) struct ExtensionsInner {
-    map: AnyMap,
-}
-
-impl ExtensionsInner {
-    /// Create an empty `Extensions`.
-    #[cfg(any(test, feature = "registry"))]
-    #[inline]
-    pub(crate) fn new() -> ExtensionsInner {
-        ExtensionsInner {
-            map: AnyMap::default(),
-        }
-    }
-
-    /// Insert a type into this `Extensions`.
-    ///
-    /// If a extension of this type already existed, it will
-    /// be returned.
-    pub(crate) fn insert<T: Send + Sync + 'static>(&mut self, val: T) -> Option<T> {
-        self.map.insert(Box::new(val)).map(|boxed| *boxed)
-    }
-
-    /// Get a reference to a type previously inserted on this `Extensions`.
-    pub(crate) fn get<T: 'static>(&self) -> Option<&T> {
-        self.map.get()
-    }
-
-    /// Get a mutable reference to a type previously inserted on this `Extensions`.
-    pub(crate) fn get_mut<T: 'static>(&mut self) -> Option<&mut T> {
-        self.map.get_mut()
-    }
-
-    /// Remove a type from this `Extensions`.
-    ///
-    /// If a extension of this type existed, it will be returned.
-    pub(crate) fn remove<T: Send + Sync + 'static>(&mut self) -> Option<T> {
-        self.map.remove().and_then(|boxed| *boxed)
-    }
-
-    /// Clear the `ExtensionsInner` in-place, dropping any elements in the map but
-    /// retaining allocated capacity.
-    ///
-    /// This permits the hash map allocation to be pooled by the registry so
-    /// that future spans will not need to allocate new hashmaps.
-    #[cfg(any(test, feature = "registry"))]
-    pub(crate) fn clear(&mut self) {
-        self.map.clear();
-    }
-}
-
-impl fmt::Debug for ExtensionsInner {
+impl fmt::Debug for Extensions<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Extensions")
-            .field("len", &self.map.len())
-            .field("capacity", &self.map.capacity())
-            .finish()
+            .field("len", &self.keys.len())
+            .finish_non_exhaustive()
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[derive(Debug, PartialEq)]
-    struct MyType(i32);
-
-    #[test]
-    fn test_extensions() {
-        let mut extensions = ExtensionsInner::new();
-
-        extensions.insert(5i32);
-        extensions.insert(MyType(10));
-
-        assert_eq!(extensions.get(), Some(&5i32));
-        assert_eq!(extensions.get_mut(), Some(&mut 5i32));
-
-        assert_eq!(extensions.remove::<i32>(), Some(5i32));
-        assert!(extensions.get::<i32>().is_none());
-
-        assert_eq!(extensions.get::<bool>(), None);
-        assert_eq!(extensions.get(), Some(&MyType(10)));
-    }
-
-    #[test]
-    fn clear_retains_capacity() {
-        let mut extensions = ExtensionsInner::new();
-        extensions.insert(5i32);
-        extensions.insert(MyType(10));
-        extensions.insert(true);
-
-        assert_eq!(extensions.map.len(), 3);
-        let prev_capacity = extensions.map.capacity();
-        extensions.clear();
-
-        assert_eq!(
-            extensions.map.len(),
-            0,
-            "after clear(), extensions map should have length 0"
-        );
-        assert_eq!(
-            extensions.map.capacity(),
-            prev_capacity,
-            "after clear(), extensions map should retain prior capacity"
-        );
-    }
-
-    #[test]
-    fn clear_drops_elements() {
-        use std::sync::Arc;
-        struct DropMePlease(Arc<()>);
-        struct DropMeTooPlease(Arc<()>);
-
-        let mut extensions = ExtensionsInner::new();
-        let val1 = DropMePlease(Arc::new(()));
-        let val2 = DropMeTooPlease(Arc::new(()));
-
-        let val1_dropped = Arc::downgrade(&val1.0);
-        let val2_dropped = Arc::downgrade(&val2.0);
-        extensions.insert(val1);
-        extensions.insert(val2);
-
-        assert!(val1_dropped.upgrade().is_some());
-        assert!(val2_dropped.upgrade().is_some());
-
-        extensions.clear();
-        assert!(
-            val1_dropped.upgrade().is_none(),
-            "after clear(), val1 should be dropped"
-        );
-        assert!(
-            val2_dropped.upgrade().is_none(),
-            "after clear(), val2 should be dropped"
-        );
+impl fmt::Debug for ExtensionsMut<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Extensions")
+            .field("len", &self.keys.len())
+            .finish_non_exhaustive()
     }
 }
+
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
+
+//     #[derive(Debug, PartialEq)]
+//     struct MyType(i32);
+
+//     #[test]
+//     fn test_extensions() {
+//         let mut extensions = ExtensionsInner::new();
+
+//         extensions.insert(5i32);
+//         extensions.insert(MyType(10));
+
+//         assert_eq!(extensions.get(), Some(&5i32));
+//         assert_eq!(extensions.get_mut(), Some(&mut 5i32));
+
+//         assert_eq!(extensions.remove::<i32>(), Some(5i32));
+//         assert!(extensions.get::<i32>().is_none());
+
+//         assert_eq!(extensions.get::<bool>(), None);
+//         assert_eq!(extensions.get(), Some(&MyType(10)));
+//     }
+
+//     #[test]
+//     fn clear_retains_capacity() {
+//         let mut extensions = ExtensionsInner::new();
+//         extensions.insert(5i32);
+//         extensions.insert(MyType(10));
+//         extensions.insert(true);
+
+//         assert_eq!(extensions.map.len(), 3);
+//         let prev_capacity = extensions.map.capacity();
+//         extensions.clear();
+
+//         assert_eq!(
+//             extensions.map.len(),
+//             0,
+//             "after clear(), extensions map should have length 0"
+//         );
+//         assert_eq!(
+//             extensions.map.capacity(),
+//             prev_capacity,
+//             "after clear(), extensions map should retain prior capacity"
+//         );
+//     }
+
+//     #[test]
+//     fn clear_drops_elements() {
+//         use std::sync::Arc;
+//         struct DropMePlease(Arc<()>);
+//         struct DropMeTooPlease(Arc<()>);
+
+//         let mut extensions = ExtensionsInner::new();
+//         let val1 = DropMePlease(Arc::new(()));
+//         let val2 = DropMeTooPlease(Arc::new(()));
+
+//         let val1_dropped = Arc::downgrade(&val1.0);
+//         let val2_dropped = Arc::downgrade(&val2.0);
+//         extensions.insert(val1);
+//         extensions.insert(val2);
+
+//         assert!(val1_dropped.upgrade().is_some());
+//         assert!(val2_dropped.upgrade().is_some());
+
+//         extensions.clear();
+//         assert!(
+//             val1_dropped.upgrade().is_none(),
+//             "after clear(), val1 should be dropped"
+//         );
+//         assert!(
+//             val2_dropped.upgrade().is_none(),
+//             "after clear(), val2 should be dropped"
+//         );
+//     }
+// }
